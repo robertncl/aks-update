@@ -72,3 +72,33 @@ jobs:
             sleep $INTERVAL
           done
         shell: bash
+
+      - name: Record Update in GitHub Pages
+        if: always()
+        run: |
+          mkdir -p gh-pages
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          RG="${{ github.event.inputs.resource_group }}"
+          CLUSTER="${{ github.event.inputs.cluster_name }}"
+          VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'kubernetesVersion' -o tsv)
+          STATUS=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'provisioningState' -o tsv)
+          echo "| $TIMESTAMP | $RG | $CLUSTER | $VERSION | $STATUS |" >> gh-pages/aks-updates.md
+          if [ ! -f gh-pages/aks-updates.md.header ]; then
+            echo "| Timestamp (UTC) | Resource Group | Cluster Name | Kubernetes Version | Status |" > gh-pages/aks-updates.md.header
+            echo "|---|---|---|---|---|" >> gh-pages/aks-updates.md.header
+          fi
+          cat gh-pages/aks-updates.md.header gh-pages/aks-updates.md > gh-pages/aks-updates-full.md
+        shell: bash
+
+      - name: Publish Update Log to GitHub Pages
+        if: always()
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./gh-pages
+          publish_branch: gh-pages
+          keep_files: true
+          destination_dir: .
+          user_name: github-actions[bot]
+          user_email: github-actions[bot]@users.noreply.github.com
+          commit_message: "Update AKS upgrade log [skip ci]"

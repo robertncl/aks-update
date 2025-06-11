@@ -43,3 +43,17 @@ jobs:
           echo "Upgrading $CLUSTER in $RG to version $VERSION"
           az aks upgrade --resource-group "$RG" --name "$CLUSTER" --kubernetes-version "$VERSION" --yes
         shell: bash
+
+      - name: Verify AKS Cluster Upgrade Status
+        run: |
+          RG="${{ github.event.inputs.resource_group }}"
+          CLUSTER="${{ github.event.inputs.cluster_name }}"
+          STATUS=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'provisioningState' -o tsv)
+          VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'kubernetesVersion' -o tsv)
+          echo "Cluster provisioning state: $STATUS"
+          echo "Cluster Kubernetes version: $VERSION"
+          if [ "$STATUS" != "Succeeded" ]; then
+            echo "ERROR: Cluster upgrade did not succeed. Current state: $STATUS"
+            exit 1
+          fi
+        shell: bash

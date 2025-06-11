@@ -1,0 +1,41 @@
+name: Update AKS Clusters
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 0' # Every Sunday at 2 AM UTC
+
+jobs:
+  update-aks:
+    runs-on: ubuntu-latest
+    env:
+      CLUSTERS: "resourceGroup1:clusterName1,resourceGroup2:clusterName2" # Edit this line
+      AKS_VERSION: "" # Set to specific version or leave empty for latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Update AKS Clusters
+        run: |
+          IFS=',' read -ra CLUSTER_LIST <<< "$CLUSTERS"
+          for entry in "${CLUSTER_LIST[@]}"; do
+            IFS=':' read -ra PARTS <<< "$entry"
+            RG="${PARTS[0]}"
+            CLUSTER="${PARTS[1]}"
+            if [ -z "$AKS_VERSION" ]; then
+              VERSION=$(az aks get-upgrades --resource-group "$RG" --name "$CLUSTER" --query 'controlPlaneProfile.upgrades[-1].kubernetesVersion' -o tsv)
+            else
+              VERSION="$AKS_VERSION"
+            fi
+            echo "Upgrading $CLUSTER in $RG to version $VERSION"
+            az aks upgrade --resource-group "$RG" --name "$CLUSTER" --kubernetes-version "$VERSION" --yes
+          done
+        shell: bash

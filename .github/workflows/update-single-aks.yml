@@ -48,12 +48,27 @@ jobs:
         run: |
           RG="${{ github.event.inputs.resource_group }}"
           CLUSTER="${{ github.event.inputs.cluster_name }}"
-          STATUS=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'provisioningState' -o tsv)
-          VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'kubernetesVersion' -o tsv)
-          echo "Cluster provisioning state: $STATUS"
-          echo "Cluster Kubernetes version: $VERSION"
-          if [ "$STATUS" != "Succeeded" ]; then
-            echo "ERROR: Cluster upgrade did not succeed. Current state: $STATUS"
-            exit 1
-          fi
+          ATTEMPTS=0
+          MAX_ATTEMPTS=30 # ~15 minutes if interval is 30s
+          INTERVAL=30
+          while true; do
+            STATUS=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'provisioningState' -o tsv)
+            VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'kubernetesVersion' -o tsv)
+            echo "Cluster provisioning state: $STATUS"
+            echo "Cluster Kubernetes version: $VERSION"
+            if [ "$STATUS" = "Succeeded" ]; then
+              echo "Cluster upgrade completed successfully."
+              break
+            elif [ "$STATUS" = "Failed" ]; then
+              echo "ERROR: Cluster upgrade failed. Current state: $STATUS"
+              exit 1
+            fi
+            ATTEMPTS=$((ATTEMPTS+1))
+            if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
+              echo "ERROR: Timed out waiting for cluster upgrade to complete."
+              exit 1
+            fi
+            echo "Waiting for upgrade to complete... ($ATTEMPTS/$MAX_ATTEMPTS)"
+            sleep $INTERVAL
+          done
         shell: bash

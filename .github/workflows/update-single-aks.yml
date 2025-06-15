@@ -72,7 +72,6 @@ jobs:
             sleep $INTERVAL
           done
         shell: bash
-
       - name: Set Output for Cluster Update
         id: set-output
         run: |
@@ -96,3 +95,4 @@ jobs:
             metadata/kubernetes_version
             metadata/status
         if: always()
+

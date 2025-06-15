@@ -1,63 +1,122 @@
-name: Record AKS Upgrade to GitHub Pages
+name: Check AKS Upgrade Status from Issues
 
 on:
-  workflow_run:
-    workflows: ["Update Single AKS Cluster"]
-    types:
-      - completed
+  schedule:
+    - cron: '0 * * * *' # Every hour at the start of the hour
+  workflow_dispatch: # Allows manual triggering
 
 jobs:
-  record-upgrade:
+  check-upgrades:
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    permissions:
+      issues: write # To comment on and close issues
+      contents: read # For checkout, if ever needed by scripts
     steps:
-      - name: Download workflow run artifacts
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Check Tracked AKS Upgrades via Issues
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const run_id = process.env.GITHUB_RUN_ID || process.env.GITHUB_RUN_NUMBER;
-            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.payload.workflow_run.id
+            const { owner, repo } = context.repo;
+            const label = 'äks-upgrade'; // Using the specified label
+
+            function parseMetadata(body) {
+              const metadata = {};
+              const commentRgMatch = body.match(/<!-- metadata[\s\S]*?resource_group: (.*?)[\s\S]*?-->/);
+              const commentClusterMatch = body.match(/<!-- metadata[\s\S]*?cluster_name: (.*?)[\s\S]*?-->/);
+              const commentTargetVersionMatch = body.match(/<!-- metadata[\s\S]*?target_version: (.*?)[\s\S]*?-->/);
+
+              if (commentRgMatch && commentRgMatch[1]) metadata.rg = commentRgMatch[1].trim();
+              if (commentClusterMatch && commentClusterMatch[1]) metadata.cluster = commentClusterMatch[1].trim();
+              if (commentTargetVersionMatch && commentTargetVersionMatch[1]) metadata.targetVersion = commentTargetVersionMatch[1].trim();
+              
+              if (!metadata.rg) {
+                const rgBodyMatch = body.match(/\*\*Resource Group:\*\*\s*\`([^\`]+)\`/);
+                if (rgBodyMatch) metadata.rg = rgBodyMatch[1];
+              }
+              if (!metadata.cluster) {
+                const clusterBodyMatch = body.match(/\*\*Cluster Name:\*\*\s*\`([^\`]+)\`/);
+                if (clusterBodyMatch) metadata.cluster = clusterBodyMatch[1];
+              }
+              if (!metadata.targetVersion) {
+                const targetVersionBodyMatch = body.match(/\*\*Target Kubernetes Version:\*\*\s*\`([^\`]+)\`/);
+                if (targetVersionBodyMatch) metadata.targetVersion = targetVersionBodyMatch[1];
+              }
+              return metadata;
+            }
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              labels: label,
+              state: 'open',
             });
-            for (const artifact of artifacts.data.artifacts) {
-              if (artifact.name === 'aks-upgrade-metadata') {
-                await github.rest.actions.downloadArtifact({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  artifact_id: artifact.id,
-                  archive_format: 'zip'
+
+            if (issues.length === 0) {
+              core.info(`No open issues found with label '${label}'.`);
+              return;
+            }
+
+            for (const issue of issues) {
+              core.info(`Processing issue #${issue.number}: ${issue.title}`);
+              const metadata = parseMetadata(issue.body);
+
+              if (!metadata.rg || !metadata.cluster || !metadata.targetVersion) {
+                core.warning(`  Could not parse all required metadata (RG, Cluster, Target Version) from issue #${issue.number}. Skipping.`);
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: `Unable to parse complete cluster details (Resource Group, Cluster Name, Target Version) from issue body. Please ensure it contains these details in the expected format (e.g., within \`<!-- metadata ... -->\` comments or specific markdown).`
                 });
+                continue;
+              }
+              
+              core.info(`  Checking AKS status for: RG=${metadata.rg}, Cluster=${metadata.cluster}, TargetVersion=${metadata.targetVersion}`);
+
+              let clusterInfo;
+              try {
+                const { exec } = require('@actions/exec');
+                let azOutput = '';
+                await exec('az', [
+                  'aks', 'show',
+                  '--resource-group', metadata.rg,
+                  '--name', metadata.cluster,
+                  '--query', '{provisioningState:provisioningState, kubernetesVersion:kubernetesVersion}',
+                  '-o', 'json'
+                ], { listeners: { stdout: (data) => { azOutput += data.toString(); } } });
+                clusterInfo = JSON.parse(azOutput);
+              } catch (error) {
+                core.error(`  Error fetching AKS status for ${metadata.cluster}: ${error.message}`);
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: `Error fetching AKS status: \`${error.message}\`. Please check Azure CLI output, permissions, and cluster details.`
+                });
+                continue;
+              }
+
+              const { provisioningState, kubernetesVersion } = clusterInfo;
+              const timestamp = new Date().toISOString();
+              let commentBody = `**Status Check at ${timestamp} (UTC):**\n- Provisioning State: \`${provisioningState}\`\n- Current Kubernetes Version: \`${kubernetesVersion}\`\n- Target Kubernetes Version: \`${metadata.targetVersion}\`\n\n`;
+
+              if (provisioningState === 'Succeeded' && kubernetesVersion === metadata.targetVersion) {
+                commentBody += `Cluster upgrade to version \`${metadata.targetVersion}\` completed successfully. Closing issue.`;
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: commentBody });
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed' });
+                core.info(`  Closed issue #${issue.number} as upgrade is successful and version matches target.`);
+              } else if (provisioningState === 'Failed') {
+                commentBody += `ERROR: Cluster upgrade has failed. Current state: \`${provisioningState}\`. Manual investigation required.`;
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: commentBody });
+                core.warning(`  Issue #${issue.number}: Upgrade failed.`);
+              } else {
+                commentBody += `Upgrade is ongoing or in an intermediate state. Will check again later.`;
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: commentBody });
+                core.info(`  Issue #${issue.number}: Upgrade in progress/intermediate state: ${provisioningState}, Version: ${kubernetesVersion}.`);
               }
             }
-      - name: Unzip artifact
-        run: |
-          mkdir -p metadata
-          unzip -o aks-upgrade-metadata.zip -d metadata
-      - name: Record Update in GitHub Pages
-        run: |
-          mkdir -p gh-pages
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          RG=$(cat metadata/resource_group)
-          CLUSTER=$(cat metadata/cluster_name)
-          VERSION=$(cat metadata/kubernetes_version)
-          STATUS=$(cat metadata/status)
-          echo "| $TIMESTAMP | $RG | $CLUSTER | $VERSION | $STATUS |" >> gh-pages/aks-updates.md
-          if [ ! -f gh-pages/aks-updates.md.header ]; then
-            echo "| Timestamp (UTC) | Resource Group | Cluster Name | Kubernetes Version | Status |" > gh-pages/aks-updates.md.header
-            echo "|---|---|---|---|---|" >> gh-pages/aks-updates.md.header
-          fi
-          cat gh-pages/aks-updates.md.header gh-pages/aks-updates.md > gh-pages/aks-updates-full.md
-        shell: bash
-      - name: Publish Update Log to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./gh-pages
-          publish_branch: gh-pages
-          keep_files: true
-          destination_dir: .
-          user_name: github-actions[bot]
-          user_email: github-actions[bot]@users.noreply.github.com
-          commit_message: "Update AKS upgrade log [skip ci]"

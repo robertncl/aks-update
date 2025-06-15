@@ -1,5 +1,9 @@
 name: Update Single AKS Cluster
 
+permissions:
+  contents: read
+  issues: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -24,24 +28,80 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Azure Login
-        uses: azure/login@v2
+        uses: azure/login@v1 # Using v1 for broader compatibility, v2 is also fine
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
+      - name: Determine Target Kubernetes Version
+        id: determine_version
+        run: |
+          RG="${{ github.event.inputs.resource_group }}"
+          CLUSTER="${{ github.event.inputs.cluster_name }}"
+          INPUT_VERSION="${{ github.event.inputs.aks_version }}"
+
+          if [ -z "$INPUT_VERSION" ]; then
+            echo "No specific version provided, querying for latest available non-preview upgrade..."
+            # Get latest stable (non-preview) version
+            LATEST_UPGRADE_VERSION=$(az aks get-upgrades --resource-group "$RG" --name "$CLUSTER" --query "controlPlaneProfile.upgrades[?isPreview==null].kubernetesVersion | sort(@) | [-1]" -o tsv)
+            if [ -z "$LATEST_UPGRADE_VERSION" ] || [ "$LATEST_UPGRADE_VERSION" = "null" ]; then
+              CURRENT_VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query "kubernetesVersion" -o tsv)
+              echo "No available non-preview upgrades found for $CLUSTER in $RG. Cluster is at $CURRENT_VERSION. Setting target to current version."
+              TARGET_K8S_VERSION="$CURRENT_VERSION"
+            else
+              echo "Latest available non-preview upgrade version: $LATEST_UPGRADE_VERSION"
+              TARGET_K8S_VERSION="$LATEST_UPGRADE_VERSION"
+            fi
+          else
+            echo "Specific version provided: $INPUT_VERSION"
+            TARGET_K8S_VERSION="$INPUT_VERSION"
+          fi
+          echo "Determined Target Kubernetes Version: $TARGET_K8S_VERSION"
+          echo "TARGET_K8S_VERSION=$TARGET_K8S_VERSION" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Create GitHub Issue for Tracking
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const rg = "${{ github.event.inputs.resource_group }}";
+            const cluster = "${{ github.event.inputs.cluster_name }}";
+            const targetVersion = "${{ steps.determine_version.outputs.TARGET_K8S_VERSION }}";
+            const issueTitle = `AKS Upgrade: ${cluster} in ${rg} to ${targetVersion}`;
+            const issueBody = `
+            Tracking upgrade for Azure Kubernetes Service cluster.
+
+            **Resource Group:** \`${rg}\`
+            **Cluster Name:** \`${cluster}\`
+            **Target Kubernetes Version:** \`${targetVersion}\`
+            **Workflow Run:** ${{ github.workflow }}#${{ github.run_number }}
+
+            <!-- metadata
+            resource_group: ${rg}
+            cluster_name: ${cluster}
+            target_version: ${targetVersion}
+            -->
+            `;
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ['äks-upgrade'] // Using the specified label
+            });
+            console.log(`Created issue for tracking: ${issue.html_url}`);
+            core.setOutput('issue_number', issue.number);
+
       - name: Update AKS Cluster
         run: |
           RG="${{ github.event.inputs.resource_group }}"
           CLUSTER="${{ github.event.inputs.cluster_name }}"
-          if [ -z "${{ github.event.inputs.aks_version }}" ]; then
-            VERSION=$(az aks get-upgrades --resource-group "$RG" --name "$CLUSTER" --query 'controlPlaneProfile.upgrades[-1].kubernetesVersion' -o tsv)
-          else
-            VERSION="${{ github.event.inputs.aks_version }}"
-          fi
-          echo "Upgrading $CLUSTER in $RG to version $VERSION"
-          az aks upgrade --resource-group "$RG" --name "$CLUSTER" --kubernetes-version "$VERSION" --yes
+          VERSION="${{ steps.determine_version.outputs.TARGET_K8S_VERSION }}"
+          echo "Attempting to upgrade $CLUSTER in $RG to version $VERSION"
+          az aks upgrade --resource-group "$RG" --name "$CLUSTER" --kubernetes-version "$VERSION" --yes --no-wait
         shell: bash
 
       - name: Verify AKS Cluster Upgrade Status
@@ -49,50 +109,29 @@ jobs:
           RG="${{ github.event.inputs.resource_group }}"
           CLUSTER="${{ github.event.inputs.cluster_name }}"
           ATTEMPTS=0
-          MAX_ATTEMPTS=30 # ~15 minutes if interval is 30s
+          MAX_ATTEMPTS=60 # ~30 minutes if interval is 30s
           INTERVAL=30
+          EXPECTED_VERSION="${{ steps.determine_version.outputs.TARGET_K8S_VERSION }}"
+
           while true; do
             STATUS=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'provisioningState' -o tsv)
-            VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'kubernetesVersion' -o tsv)
+            CURRENT_K8S_VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'kubernetesVersion' -o tsv)
             echo "Cluster provisioning state: $STATUS"
-            echo "Cluster Kubernetes version: $VERSION"
+            echo "Cluster Kubernetes version: $CURRENT_K8S_VERSION (Target: $EXPECTED_VERSION)"
+
             if [ "$STATUS" = "Succeeded" ]; then
-              echo "Cluster upgrade completed successfully."
+              echo "Cluster provisioning Succeeded. Final version check will be done by the tracking issue monitor."
               break
             elif [ "$STATUS" = "Failed" ]; then
-              echo "ERROR: Cluster upgrade failed. Current state: $STATUS"
+              echo "ERROR: Cluster upgrade process reported Failed state. Current state: $STATUS"
               exit 1
             fi
             ATTEMPTS=$((ATTEMPTS+1))
             if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
-              echo "ERROR: Timed out waiting for cluster upgrade to complete."
+              echo "ERROR: Timed out waiting for cluster to reach a stable state post-upgrade initiation."
               exit 1
             fi
             echo "Waiting for upgrade to complete... ($ATTEMPTS/$MAX_ATTEMPTS)"
             sleep $INTERVAL
           done
         shell: bash
-      - name: Set Output for Cluster Update
-        id: set-output
-        run: |
-          RG="${{ github.event.inputs.resource_group }}"
-          CLUSTER="${{ github.event.inputs.cluster_name }}"
-          VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'kubernetesVersion' -o tsv)
-          STATUS=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query 'provisioningState' -o tsv)
-          echo "resource_group=$RG" >> $GITHUB_OUTPUT
-          echo "cluster_name=$CLUSTER" >> $GITHUB_OUTPUT
-          echo "kubernetes_version=$VERSION" >> $GITHUB_OUTPUT
-          echo "status=$STATUS" >> $GITHUB_OUTPUT
-        shell: bash
-
-      - name: Upload AKS Upgrade Metadata
-        uses: actions/upload-artifact@v4
-        with:
-          name: aks-upgrade-metadata
-          path: |
-            metadata/resource_group
-            metadata/cluster_name
-            metadata/kubernetes_version
-            metadata/status
-        if: always()
-

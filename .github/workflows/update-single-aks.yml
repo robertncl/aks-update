@@ -85,3 +85,14 @@ jobs:
           echo "kubernetes_version=$VERSION" >> $GITHUB_OUTPUT
           echo "status=$STATUS" >> $GITHUB_OUTPUT
         shell: bash
+
+      - name: Upload AKS Upgrade Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: aks-upgrade-metadata
+          path: |
+            metadata/resource_group
+            metadata/cluster_name
+            metadata/kubernetes_version
+            metadata/status
+        if: always()

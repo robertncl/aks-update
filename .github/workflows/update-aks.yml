@@ -30,12 +30,30 @@ jobs:
             IFS=':' read -ra PARTS <<< "$entry"
             RG="${PARTS[0]}"
             CLUSTER="${PARTS[1]}"
+            TARGET_K8S_VERSION=""
+
             if [ -z "$AKS_VERSION" ]; then
-              VERSION=$(az aks get-upgrades --resource-group "$RG" --name "$CLUSTER" --query 'controlPlaneProfile.upgrades[-1].kubernetesVersion' -o tsv)
+              echo "No specific version provided for $CLUSTER, querying for latest available non-preview upgrade..."
+              LATEST_UPGRADE_VERSION=$(az aks get-upgrades --resource-group "$RG" --name "$CLUSTER" --query "controlPlaneProfile.upgrades[?isPreview==null].kubernetesVersion | sort(@) | [-1]" -o tsv)
+
+              if [ -z "$LATEST_UPGRADE_VERSION" ] || [ "$LATEST_UPGRADE_VERSION" = "null" ]; then
+                echo "No available non-preview upgrades found for $CLUSTER. Skipping."
+                continue
+              else
+                echo "Latest available non-preview upgrade version for $CLUSTER: $LATEST_UPGRADE_VERSION"
+                TARGET_K8S_VERSION="$LATEST_UPGRADE_VERSION"
+              fi
             else
-              VERSION="$AKS_VERSION"
+              echo "Specific version provided for all clusters: $AKS_VERSION"
+              TARGET_K8S_VERSION="$AKS_VERSION"
             fi
-            echo "Upgrading $CLUSTER in $RG to version $VERSION"
-            az aks upgrade --resource-group "$RG" --name "$CLUSTER" --kubernetes-version "$VERSION" --yes
+
+            CURRENT_VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query "kubernetesVersion" -o tsv)
+            if [ "$TARGET_K8S_VERSION" = "$CURRENT_VERSION" ]; then
+              echo "Cluster $CLUSTER is already at the target version $TARGET_K8S_VERSION. No upgrade needed."
+            else
+              echo "Attempting to upgrade $CLUSTER in $RG to version $TARGET_K8S_VERSION"
+              az aks upgrade --resource-group "$RG" --name "$CLUSTER" --kubernetes-version "$TARGET_K8S_VERSION" --yes
+            fi
           done
         shell: bash

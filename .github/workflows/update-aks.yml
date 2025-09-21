@@ -1,7 +1,19 @@
+#
+# Workflow: Update AKS Clusters (Batch)
+#
+# Description:
+# This workflow automates the upgrade of multiple Azure Kubernetes Service (AKS) clusters
+# in a batch process. It can be run manually or on a schedule.
+#
+# Note: This workflow does NOT create GitHub Issues for tracking. It is intended for
+# bulk updates where individual tracking is not required.
+#
 name: Update AKS Clusters
 
 on:
+  # Allows manual triggering from the GitHub Actions UI.
   workflow_dispatch:
+  # Sets a schedule for the workflow to run automatically.
   schedule:
     - cron: '0 2 * * 0' # Every Sunday at 2 AM UTC
 
@@ -9,12 +21,25 @@ jobs:
   update-aks:
     runs-on: ubuntu-latest
     env:
+      #
+      # Configuration:
+      # - CLUSTERS: A comma-separated list of AKS clusters to update.
+      #             Format: "resourceGroup1:clusterName1,resourceGroup2:clusterName2"
+      # - AKS_VERSION: The target Kubernetes version.
+      #                - Leave empty ("") to upgrade each cluster to its latest available
+      #                  stable (non-preview) version.
+      #                - Set a specific version (e.g., "1.23.5") to upgrade all clusters
+      #                  to that version.
+      #
       CLUSTERS: "resourceGroup1:clusterName1,resourceGroup2:clusterName2" # Edit this line
       AKS_VERSION: "" # Set to specific version or leave empty for latest
     steps:
+      # Step 1: Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Step 2: Azure Login
+      # Authenticates with Azure using credentials stored in GitHub secrets.
       - name: Azure Login
         uses: azure/login@v2
         with:
@@ -23,6 +48,9 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
+      # Step 3: Update AKS Clusters
+      # This script iterates through the list of clusters defined in the CLUSTERS
+      # environment variable and performs the upgrade.
       - name: Update AKS Clusters
         run: |
           IFS=',' read -ra CLUSTER_LIST <<< "$CLUSTERS"
@@ -32,6 +60,7 @@ jobs:
             CLUSTER="${PARTS[1]}"
             TARGET_K8S_VERSION=""
 
+            # Determine the target Kubernetes version for the current cluster.
             if [ -z "$AKS_VERSION" ]; then
               echo "No specific version provided for $CLUSTER, querying for latest available non-preview upgrade..."
               LATEST_UPGRADE_VERSION=$(az aks get-upgrades --resource-group "$RG" --name "$CLUSTER" --query "controlPlaneProfile.upgrades[?isPreview==null].kubernetesVersion | sort(@) | [-1]" -o tsv)
@@ -48,10 +77,12 @@ jobs:
               TARGET_K8S_VERSION="$AKS_VERSION"
             fi
 
+            # Check if the cluster is already at the target version.
             CURRENT_VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query "kubernetesVersion" -o tsv)
             if [ "$TARGET_K8S_VERSION" = "$CURRENT_VERSION" ]; then
               echo "Cluster $CLUSTER is already at the target version $TARGET_K8S_VERSION. No upgrade needed."
             else
+              # Initiate the upgrade. The '--yes' flag confirms the upgrade automatically.
               echo "Attempting to upgrade $CLUSTER in $RG to version $TARGET_K8S_VERSION"
               az aks upgrade --resource-group "$RG" --name "$CLUSTER" --kubernetes-version "$TARGET_K8S_VERSION" --yes
             fi

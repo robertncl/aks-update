@@ -1,9 +1,32 @@
+#
+# Workflow: Update Single AKS Cluster
+#
+# Description:
+# This workflow automates the process of upgrading a single Azure Kubernetes Service (AKS)
+# cluster. It can be triggered manually and creates a GitHub Issue to track the
+# progress of the upgrade.
+#
+# Permissions:
+# - contents: read - To checkout the repository code.
+# - issues: write - To create and manage GitHub Issues for tracking.
+#
 name: Update Single AKS Cluster
 
 permissions:
   contents: read
   issues: write
 
+#
+# Trigger: workflow_dispatch
+#
+# This allows the workflow to be run manually from the GitHub Actions UI.
+#
+# Inputs:
+# - resource_group: The name of the Azure Resource Group containing the AKS cluster.
+# - cluster_name: The name of the AKS cluster to be upgraded.
+# - aks_version: The target Kubernetes version. If left empty, the workflow will
+#                automatically determine the latest available stable (non-preview) version.
+#
 on:
   workflow_dispatch:
     inputs:
@@ -24,9 +47,13 @@ jobs:
   update-aks:
     runs-on: ubuntu-latest
     steps:
+      # Step 1: Checkout repository
+      # Checks out the repository code so that the workflow can access any scripts or files.
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Step 2: Azure Login
+      # Authenticates with Azure using credentials stored in GitHub secrets.
       - name: Azure Login
         uses: azure/login@v1 # Using v1 for broader compatibility, v2 is also fine
         with:
@@ -35,6 +62,12 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
+      # Step 3: Determine Target Kubernetes Version
+      # This step determines the Kubernetes version to upgrade to.
+      # - If a version is provided in the workflow inputs, it uses that version.
+      # - If no version is provided, it queries Azure for the latest available stable
+      #   (non-preview) upgrade for the specified cluster.
+      # - If no upgrades are available, it defaults to the cluster's current version.
       - name: Determine Target Kubernetes Version
         id: determine_version
         run: |
@@ -44,7 +77,6 @@ jobs:
 
           if [ -z "$INPUT_VERSION" ]; then
             echo "No specific version provided, querying for latest available non-preview upgrade..."
-            # Get latest stable (non-preview) version
             LATEST_UPGRADE_VERSION=$(az aks get-upgrades --resource-group "$RG" --name "$CLUSTER" --query "controlPlaneProfile.upgrades[?isPreview==null].kubernetesVersion | sort(@) | [-1]" -o tsv)
             if [ -z "$LATEST_UPGRADE_VERSION" ] || [ "$LATEST_UPGRADE_VERSION" = "null" ]; then
               CURRENT_VERSION=$(az aks show --resource-group "$RG" --name "$CLUSTER" --query "kubernetesVersion" -o tsv)
@@ -62,6 +94,10 @@ jobs:
           echo "TARGET_K8S_VERSION=$TARGET_K8S_VERSION" >> $GITHUB_OUTPUT
         shell: bash
 
+      # Step 4: Create GitHub Issue for Tracking
+      # Creates a GitHub Issue to provide a visible record of the upgrade process.
+      # The issue body contains metadata about the cluster and a link to the workflow run.
+      # This metadata is used by the `record-aks-upgrade.yml` workflow to check the status.
       - name: Create GitHub Issue for Tracking
         uses: actions/github-script@v7
         with:
@@ -77,7 +113,7 @@ jobs:
             **Resource Group:** \`${rg}\`
             **Cluster Name:** \`${cluster}\`
             **Target Kubernetes Version:** \`${targetVersion}\`
-            **Workflow Run:** ${{ github.workflow }}#${{ github.run_number }}
+            **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             <!-- metadata
             resource_group: ${rg}
@@ -90,11 +126,15 @@ jobs:
               repo: context.repo.repo,
               title: issueTitle,
               body: issueBody,
-              labels: ['äks-upgrade'] // Using the specified label
+              labels: ['äks-upgrade']
             });
             console.log(`Created issue for tracking: ${issue.html_url}`);
             core.setOutput('issue_number', issue.number);
 
+      # Step 5: Update AKS Cluster
+      # Initiates the AKS upgrade using the Azure CLI.
+      # The `--no-wait` flag returns the command prompt immediately after the upgrade
+      # operation is successfully initiated, without waiting for it to complete.
       - name: Update AKS Cluster
         run: |
           RG="${{ github.event.inputs.resource_group }}"
@@ -104,6 +144,13 @@ jobs:
           az aks upgrade --resource-group "$RG" --name "$CLUSTER" --kubernetes-version "$VERSION" --yes --no-wait
         shell: bash
 
+      # Step 6: Verify AKS Cluster Upgrade Status
+      # This step monitors the initial phase of the upgrade to catch immediate failures.
+      # It checks the provisioning state of the cluster periodically.
+      # - If the state becomes "Succeeded", it assumes the upgrade has started successfully.
+      # - If the state becomes "Failed", it exits with an error.
+      # - It times out after a set number of attempts to prevent long-running workflows.
+      # Note: The final confirmation of the upgrade is handled by the `record-aks-upgrade.yml` workflow.
       - name: Verify AKS Cluster Upgrade Status
         run: |
           RG="${{ github.event.inputs.resource_group }}"

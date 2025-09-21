@@ -13,8 +13,6 @@ name: Check AKS Upgrade Status from Issues
 
 on:
   workflow_dispatch: # Allows manual triggering
-  schedule:
-    - cron: '0 * * * *' # Runs at the beginning of every hour
 
 jobs:
   check-upgrades:

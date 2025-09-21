@@ -14,8 +14,8 @@ on:
   # Allows manual triggering from the GitHub Actions UI.
   workflow_dispatch:
   # Sets a schedule for the workflow to run automatically.
-  schedule:
-    - cron: '0 2 * * 0' # Every Sunday at 2 AM UTC
+  #schedule:
+  #  - cron: '0 2 * * 0' # Every Sunday at 2 AM UTC
 
 jobs:
   update-aks:
